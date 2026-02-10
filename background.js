@@ -7,6 +7,9 @@ const BADGE = {
   error: { text: '!', color: '#B91C1C' },
 }
 
+/** Global enabled state — when true, auto-attach to all tabs. */
+let globalEnabled = false
+
 /** @type {WebSocket|null} */
 let relayWs = null
 /** @type {Promise<void>|null} */
@@ -104,6 +107,7 @@ async function ensureRelayConnection() {
 
 function onRelayClosed(reason) {
   relayWs = null
+  globalEnabled = false
   for (const [id, p] of pending.entries()) {
     pending.delete(id)
     p.reject(new Error(`Relay disconnected (${reason})`))
@@ -111,10 +115,10 @@ function onRelayClosed(reason) {
 
   for (const tabId of tabs.keys()) {
     void chrome.debugger.detach({ tabId }).catch(() => {})
-    setBadge(tabId, 'connecting')
+    setBadge(tabId, 'off')
     void chrome.action.setTitle({
       tabId,
-      title: 'OpenClaw Browser Relay: disconnected (click to re-attach)',
+      title: 'OpenClaw Browser Relay: disconnected (click to re-enable)',
     })
   }
   tabs.clear()
@@ -282,38 +286,69 @@ async function detachTab(tabId, reason) {
   })
 }
 
-async function connectOrToggleForActiveTab() {
-  const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
-  const tabId = active?.id
-  if (!tabId) return
-
-  const existing = tabs.get(tabId)
-  if (existing?.state === 'connected') {
-    await detachTab(tabId, 'toggle')
-    return
-  }
-
+/** Try to attach a single tab, silently skip chrome:// and other restricted URLs. */
+async function tryAttachTab(tabId) {
+  if (tabs.has(tabId)) return // already attached or connecting
   tabs.set(tabId, { state: 'connecting' })
   setBadge(tabId, 'connecting')
-  void chrome.action.setTitle({
-    tabId,
-    title: 'OpenClaw Browser Relay: connecting to local relay…',
-  })
-
   try {
-    await ensureRelayConnection()
     await attachTab(tabId)
   } catch (err) {
     tabs.delete(tabId)
-    setBadge(tabId, 'error')
-    void chrome.action.setTitle({
-      tabId,
-      title: 'OpenClaw Browser Relay: relay not running (open options for setup)',
-    })
-    void maybeOpenHelpOnce()
-    // Extra breadcrumbs in chrome://extensions service worker logs.
+    setBadge(tabId, 'off')
+    // chrome:// / edge:// / devtools:// tabs will fail — that's expected.
     const message = err instanceof Error ? err.message : String(err)
-    console.warn('attach failed', message, nowStack())
+    console.info('skip tab', tabId, message)
+  }
+}
+
+/** Attach debugger to ALL existing normal tabs. */
+async function attachAllTabs() {
+  const allTabs = await chrome.tabs.query({})
+  for (const tab of allTabs) {
+    if (!tab.id) continue
+    // Skip restricted URLs that the debugger cannot attach to.
+    const url = tab.url || tab.pendingUrl || ''
+    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('devtools://') || url.startsWith('edge://')) continue
+    await tryAttachTab(tab.id)
+  }
+}
+
+/** Detach debugger from ALL currently attached tabs. */
+async function detachAllTabs() {
+  const tabIds = [...tabs.keys()]
+  for (const tabId of tabIds) {
+    await detachTab(tabId, 'global-off')
+  }
+}
+
+/** Global toggle: one click enables for all tabs, another click disables all. */
+async function toggleGlobal() {
+  if (globalEnabled) {
+    // Turn OFF globally
+    globalEnabled = false
+    await detachAllTabs()
+    return
+  }
+
+  // Turn ON globally
+  globalEnabled = true
+  try {
+    await ensureRelayConnection()
+    await attachAllTabs()
+  } catch (err) {
+    globalEnabled = false
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (active?.id) {
+      setBadge(active.id, 'error')
+      void chrome.action.setTitle({
+        tabId: active.id,
+        title: 'OpenClaw Browser Relay: relay not running (open options for setup)',
+      })
+    }
+    void maybeOpenHelpOnce()
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn('global enable failed', message, nowStack())
   }
 }
 
@@ -430,7 +465,56 @@ function onDebuggerDetach(source, reason) {
   void detachTab(tabId, reason)
 }
 
-chrome.action.onClicked.addListener(() => void connectOrToggleForActiveTab())
+chrome.action.onClicked.addListener(() => void toggleGlobal())
+
+// Auto-attach when a new tab finishes loading (if globally enabled).
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!globalEnabled) return
+  if (changeInfo.status !== 'complete') return
+  const url = tab.url || tab.pendingUrl || ''
+  if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('devtools://') || url.startsWith('edge://')) return
+  if (tabs.has(tabId)) return
+  void (async () => {
+    try {
+      await ensureRelayConnection()
+      await tryAttachTab(tabId)
+    } catch {
+      // relay down — ignore
+    }
+  })()
+})
+
+// Auto-attach when a new tab is created (if globally enabled).
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!globalEnabled) return
+  if (!tab.id) return
+  // Wait a bit for the tab to initialise before attaching.
+  setTimeout(() => {
+    if (!globalEnabled || !tab.id) return
+    const url = tab.url || tab.pendingUrl || ''
+    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('devtools://') || url.startsWith('edge://')) return
+    if (tabs.has(tab.id)) return
+    void (async () => {
+      try {
+        await ensureRelayConnection()
+        await tryAttachTab(tab.id)
+      } catch {
+        // ignore
+      }
+    })()
+  }, 500)
+})
+
+// Clean up state when a tab is closed.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (!tabs.has(tabId)) return
+  const tab = tabs.get(tabId)
+  if (tab?.sessionId) tabBySession.delete(tab.sessionId)
+  tabs.delete(tabId)
+  for (const [childSessionId, parentTabId] of childSessionToTab.entries()) {
+    if (parentTabId === tabId) childSessionToTab.delete(childSessionId)
+  }
+})
 
 chrome.runtime.onInstalled.addListener(() => {
   // Useful: first-time instructions.
