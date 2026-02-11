@@ -7,8 +7,12 @@ const BADGE = {
   error: { text: '!', color: '#B91C1C' },
 }
 
-/** Global enabled state — when true, auto-attach to all tabs. */
-let globalEnabled = false
+/** Global enabled state — always on, auto-attach to all tabs. */
+let globalEnabled = true
+
+/** Retry timer for auto-reconnect when relay is down. */
+let retryTimer = null
+const RETRY_INTERVAL = 3000
 
 /** @type {WebSocket|null} */
 let relayWs = null
@@ -69,7 +73,9 @@ async function ensureRelayConnection() {
     }
 
     const ws = new WebSocket(wsUrl)
-    relayWs = ws
+
+    // Install message handler BEFORE awaiting connection to avoid missing early messages.
+    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
 
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('WebSocket connect timeout')), 5000)
@@ -87,7 +93,8 @@ async function ensureRelayConnection() {
       }
     })
 
-    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
+    // Set relayWs AFTER successful connection.
+    relayWs = ws
     ws.onclose = () => onRelayClosed('closed')
     ws.onerror = () => onRelayClosed('error')
 
@@ -107,7 +114,6 @@ async function ensureRelayConnection() {
 
 function onRelayClosed(reason) {
   relayWs = null
-  globalEnabled = false
   for (const [id, p] of pending.entries()) {
     pending.delete(id)
     p.reject(new Error(`Relay disconnected (${reason})`))
@@ -116,14 +122,13 @@ function onRelayClosed(reason) {
   for (const tabId of tabs.keys()) {
     void chrome.debugger.detach({ tabId }).catch(() => {})
     setBadge(tabId, 'off')
-    void chrome.action.setTitle({
-      tabId,
-      title: 'OpenClaw Browser Relay: disconnected (click to re-enable)',
-    })
   }
   tabs.clear()
   tabBySession.clear()
   childSessionToTab.clear()
+
+  // Auto-reconnect: keep trying until relay is back.
+  scheduleRetry()
 }
 
 function sendToRelay(payload) {
@@ -132,30 +137,6 @@ function sendToRelay(payload) {
     throw new Error('Relay not connected')
   }
   ws.send(JSON.stringify(payload))
-}
-
-async function maybeOpenHelpOnce() {
-  try {
-    const stored = await chrome.storage.local.get(['helpOnErrorShown'])
-    if (stored.helpOnErrorShown === true) return
-    await chrome.storage.local.set({ helpOnErrorShown: true })
-    await chrome.runtime.openOptionsPage()
-  } catch {
-    // ignore
-  }
-}
-
-function requestFromRelay(command) {
-  const id = command.id
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject })
-    try {
-      sendToRelay(command)
-    } catch (err) {
-      pending.delete(id)
-      reject(err instanceof Error ? err : new Error(String(err)))
-    }
-  })
 }
 
 async function onRelayMessage(text) {
@@ -327,28 +308,44 @@ async function toggleGlobal() {
   if (globalEnabled) {
     // Turn OFF globally
     globalEnabled = false
+    clearRetryTimer()
     await detachAllTabs()
     return
   }
 
   // Turn ON globally
   globalEnabled = true
+  await enableGlobal()
+}
+
+/** Enable relay connection + attach all tabs. Called on startup and toggle-on. */
+async function enableGlobal() {
   try {
     await ensureRelayConnection()
     await attachAllTabs()
   } catch (err) {
-    globalEnabled = false
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
-    if (active?.id) {
-      setBadge(active.id, 'error')
-      void chrome.action.setTitle({
-        tabId: active.id,
-        title: 'OpenClaw Browser Relay: relay not running (open options for setup)',
-      })
-    }
-    void maybeOpenHelpOnce()
     const message = err instanceof Error ? err.message : String(err)
-    console.warn('global enable failed', message, nowStack())
+    console.warn('enableGlobal failed, will retry', message)
+    scheduleRetry()
+  }
+}
+
+/** Schedule a retry to connect to relay. */
+function scheduleRetry() {
+  clearRetryTimer()
+  if (!globalEnabled) return
+  retryTimer = setTimeout(() => {
+    retryTimer = null
+    if (!globalEnabled) return
+    void enableGlobal()
+  }, RETRY_INTERVAL)
+}
+
+/** Clear pending retry timer. */
+function clearRetryTimer() {
+  if (retryTimer) {
+    clearTimeout(retryTimer)
+    retryTimer = null
   }
 }
 
@@ -463,11 +460,19 @@ function onDebuggerDetach(source, reason) {
   if (!tabId) return
   if (!tabs.has(tabId)) return
   void detachTab(tabId, reason)
+
+  // Auto re-attach if globally enabled (e.g. after DevTools closes).
+  if (globalEnabled) {
+    setTimeout(() => {
+      if (!globalEnabled || tabs.has(tabId)) return
+      void tryAttachTab(tabId)
+    }, 1000)
+  }
 }
 
 chrome.action.onClicked.addListener(() => void toggleGlobal())
 
-// Auto-attach when a new tab finishes loading (if globally enabled).
+// Auto-attach when a new tab finishes loading.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!globalEnabled) return
   if (changeInfo.status !== 'complete') return
@@ -479,16 +484,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       await ensureRelayConnection()
       await tryAttachTab(tabId)
     } catch {
-      // relay down — ignore
+      // relay down — retry will handle it
     }
   })()
 })
 
-// Auto-attach when a new tab is created (if globally enabled).
+// Auto-attach when a new tab is created.
 chrome.tabs.onCreated.addListener((tab) => {
   if (!globalEnabled) return
   if (!tab.id) return
-  // Wait a bit for the tab to initialise before attaching.
   setTimeout(() => {
     if (!globalEnabled || !tab.id) return
     const url = tab.url || tab.pendingUrl || ''
@@ -516,7 +520,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 })
 
+// Auto-enable on install — no manual click needed.
 chrome.runtime.onInstalled.addListener(() => {
-  // Useful: first-time instructions.
-  void chrome.runtime.openOptionsPage()
+  globalEnabled = true
+  void enableGlobal()
 })
+
+// Auto-enable when service worker starts (e.g. after browser restart).
+// Service worker can be killed and restarted by Chrome at any time,
+// so we always try to connect on startup.
+globalEnabled = true
+void enableGlobal()
