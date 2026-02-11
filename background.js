@@ -4,11 +4,10 @@ const BADGE = {
   on: { text: 'ON', color: '#FF5A36' },
   off: { text: '', color: '#000000' },
   connecting: { text: '…', color: '#F59E0B' },
-  error: { text: '!', color: '#B91C1C' },
 }
 
-/** Global enabled state — always on, auto-attach to all tabs. */
-let globalEnabled = true
+/** Global enabled state — loaded from storage, defaults to false until storage is read. */
+let globalEnabled = false
 
 /** Retry timer for auto-reconnect when relay is down. */
 let retryTimer = null
@@ -32,14 +31,6 @@ const childSessionToTab = new Map()
 
 /** @type {Map<number, {resolve:(v:any)=>void, reject:(e:Error)=>void}>} */
 const pending = new Map()
-
-function nowStack() {
-  try {
-    return new Error().stack || ''
-  } catch {
-    return ''
-  }
-}
 
 async function getRelayPort() {
   const stored = await chrome.storage.local.get(['relayPort'])
@@ -210,7 +201,7 @@ async function attachTab(tabId, opts = {}) {
   tabBySession.set(sessionId, tabId)
   void chrome.action.setTitle({
     tabId,
-    title: 'OpenClaw Browser Relay: attached (click to detach)',
+    title: 'OpenClaw Browser Relay: attached (click icon to toggle off)',
   })
 
   if (!opts.skipAttachedEvent) {
@@ -263,7 +254,7 @@ async function detachTab(tabId, reason) {
   setBadge(tabId, 'off')
   void chrome.action.setTitle({
     tabId,
-    title: 'OpenClaw Browser Relay (click to attach/detach)',
+    title: 'OpenClaw Browser Relay (off, click icon to re-enable)',
   })
 }
 
@@ -276,8 +267,9 @@ async function tryAttachTab(tabId) {
     await attachTab(tabId)
   } catch (err) {
     tabs.delete(tabId)
+    // Detach debugger to avoid ghost attach (debugger attached but map cleared).
+    try { await chrome.debugger.detach({ tabId }) } catch { /* ignore */ }
     setBadge(tabId, 'off')
-    // chrome:// / edge:// / devtools:// tabs will fail — that's expected.
     const message = err instanceof Error ? err.message : String(err)
     console.info('skip tab', tabId, message)
   }
@@ -306,8 +298,9 @@ async function detachAllTabs() {
 /** Global toggle: one click enables for all tabs, another click disables all. */
 async function toggleGlobal() {
   if (globalEnabled) {
-    // Turn OFF globally
+    // Turn OFF globally — persist to storage so worker restart respects it.
     globalEnabled = false
+    await chrome.storage.local.set({ globalEnabled: false })
     clearRetryTimer()
     await detachAllTabs()
     return
@@ -315,6 +308,7 @@ async function toggleGlobal() {
 
   // Turn ON globally
   globalEnabled = true
+  await chrome.storage.local.set({ globalEnabled: true })
   await enableGlobal()
 }
 
@@ -455,19 +449,55 @@ function onDebuggerEvent(source, method, params) {
   }
 }
 
+/** @type {Map<number, ReturnType<typeof setTimeout>>} */
+const reattachTimers = new Map()
+
+function scheduleReattach(tabId, delay = 1000) {
+  cancelReattach(tabId)
+  if (!globalEnabled) return
+  const timer = setTimeout(async () => {
+    reattachTimers.delete(tabId)
+    if (!globalEnabled) return
+    // Check if tab still exists before trying to re-attach.
+    try {
+      await chrome.tabs.get(tabId)
+    } catch {
+      return // tab was closed
+    }
+    if (tabs.has(tabId)) return // already re-attached
+    try {
+      await ensureRelayConnection()
+    } catch {
+      // Relay is still down; retry later with backoff.
+      scheduleReattach(tabId, Math.min(delay * 2, 10000))
+      return
+    }
+    await tryAttachTab(tabId)
+    // tryAttachTab swallows errors, so verify connected state explicitly.
+    if (!tabs.has(tabId) || tabs.get(tabId)?.state !== 'connected') {
+      // Still failing (e.g. DevTools still open), retry with backoff (max 10s).
+      scheduleReattach(tabId, Math.min(delay * 2, 10000))
+    }
+  }, delay)
+  reattachTimers.set(tabId, timer)
+}
+
+function cancelReattach(tabId) {
+  const timer = reattachTimers.get(tabId)
+  if (timer) {
+    clearTimeout(timer)
+    reattachTimers.delete(tabId)
+  }
+}
+
 function onDebuggerDetach(source, reason) {
   const tabId = source.tabId
   if (!tabId) return
   if (!tabs.has(tabId)) return
   void detachTab(tabId, reason)
 
-  // Auto re-attach if globally enabled (e.g. after DevTools closes).
-  if (globalEnabled) {
-    setTimeout(() => {
-      if (!globalEnabled || tabs.has(tabId)) return
-      void tryAttachTab(tabId)
-    }, 1000)
-  }
+  // Auto re-attach with persistent retry (e.g. after DevTools closes).
+  scheduleReattach(tabId)
 }
 
 chrome.action.onClicked.addListener(() => void toggleGlobal())
@@ -511,6 +541,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 // Clean up state when a tab is closed.
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelReattach(tabId)
   if (!tabs.has(tabId)) return
   const tab = tabs.get(tabId)
   if (tab?.sessionId) tabBySession.delete(tab.sessionId)
@@ -520,14 +551,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 })
 
-// Auto-enable on install — no manual click needed.
-chrome.runtime.onInstalled.addListener(() => {
-  globalEnabled = true
-  void enableGlobal()
+// Only force-enable on first install, not on updates (respect user's toggle-off).
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    chrome.storage.local.set({ globalEnabled: true })
+    globalEnabled = true
+    void enableGlobal()
+  }
 })
 
 // Auto-enable when service worker starts (e.g. after browser restart).
-// Service worker can be killed and restarted by Chrome at any time,
-// so we always try to connect on startup.
-globalEnabled = true
-void enableGlobal()
+// Reads persisted state so manual toggle-off survives worker restarts.
+void (async () => {
+  const stored = await chrome.storage.local.get(['globalEnabled'])
+  // Default to true if never set (first run before onInstalled fires).
+  globalEnabled = stored.globalEnabled !== false
+  if (globalEnabled) {
+    void enableGlobal()
+  }
+})()
