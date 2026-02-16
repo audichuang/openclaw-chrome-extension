@@ -4,12 +4,10 @@ const BADGE = {
   on: { text: 'ON', color: '#FF5A36' },
   off: { text: '', color: '#000000' },
   connecting: { text: '…', color: '#F59E0B' },
+  error: { text: '!', color: '#B91C1C' },
 }
 
-/** Global enabled state — loaded from storage, defaults to false until storage is read. */
 let globalEnabled = false
-
-/** Retry timer for auto-reconnect when relay is down. */
 let retryTimer = null
 const RETRY_INTERVAL = 3000
 
@@ -56,7 +54,6 @@ async function ensureRelayConnection() {
     const httpBase = `http://127.0.0.1:${port}`
     const wsUrl = `ws://127.0.0.1:${port}/extension`
 
-    // Fast preflight: is the relay server up?
     try {
       await fetch(`${httpBase}/`, { method: 'HEAD', signal: AbortSignal.timeout(2000) })
     } catch (err) {
@@ -64,9 +61,6 @@ async function ensureRelayConnection() {
     }
 
     const ws = new WebSocket(wsUrl)
-
-    // Install message handler BEFORE awaiting connection to avoid missing early messages.
-    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
 
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('WebSocket connect timeout')), 5000)
@@ -84,8 +78,7 @@ async function ensureRelayConnection() {
       }
     })
 
-    // Set relayWs AFTER successful connection.
-    relayWs = ws
+    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
     ws.onclose = () => onRelayClosed('closed')
     ws.onerror = () => onRelayClosed('error')
 
@@ -105,24 +98,20 @@ async function ensureRelayConnection() {
 
 function onRelayClosed(reason) {
   relayWs = null
+
   for (const [id, p] of pending.entries()) {
     pending.delete(id)
     p.reject(new Error(`Relay disconnected (${reason})`))
   }
 
-  // Keep debuggers attached — only clear relay-specific session mappings.
-  // Tabs stay in the `tabs` Map so we can re-announce them after reconnect.
+  for (const tabId of tabs.keys()) {
+    void chrome.debugger.detach({ tabId }).catch(() => {})
+    setBadge(tabId, 'off')
+  }
+  tabs.clear()
   tabBySession.clear()
   childSessionToTab.clear()
 
-  // Mark all tabs as needing re-announce (clear sessionId so reannounce assigns new ones).
-  for (const tab of tabs.values()) {
-    if (tab.state === 'connected') {
-      tab.sessionId = undefined
-    }
-  }
-
-  // Auto-reconnect: keep trying until relay is back.
   scheduleRetry()
 }
 
@@ -205,7 +194,7 @@ async function attachTab(tabId, opts = {}) {
   tabBySession.set(sessionId, tabId)
   void chrome.action.setTitle({
     tabId,
-    title: 'OpenClaw Browser Relay: attached (click icon to toggle off)',
+    title: 'OpenClaw Browser Relay: attached (click to detach)',
   })
 
   if (!opts.skipAttachedEvent) {
@@ -258,34 +247,29 @@ async function detachTab(tabId, reason) {
   setBadge(tabId, 'off')
   void chrome.action.setTitle({
     tabId,
-    title: 'OpenClaw Browser Relay (off, click icon to re-enable)',
+    title: 'OpenClaw Browser Relay (click to attach/detach)',
   })
 }
 
-/** Try to attach a single tab, silently skip chrome:// and other restricted URLs. */
 async function tryAttachTab(tabId) {
-  if (tabs.has(tabId)) return // already attached or connecting
+  if (tabs.has(tabId)) return
   tabs.set(tabId, { state: 'connecting' })
   setBadge(tabId, 'connecting')
   try {
     await attachTab(tabId)
   } catch (err) {
     tabs.delete(tabId)
-    // Detach debugger to avoid ghost attach (debugger attached but map cleared).
     try { await chrome.debugger.detach({ tabId }) } catch { /* ignore */ }
     setBadge(tabId, 'off')
-    const message = err instanceof Error ? err.message : String(err)
-    console.info('skip tab', tabId, message)
+    console.info('skip tab', tabId, err instanceof Error ? err.message : String(err))
   }
 }
 
-/** Re-announce all currently-attached tabs to the relay after reconnect. */
 async function reannounceAllTabs() {
   for (const [tabId, tab] of tabs.entries()) {
     if (tab.state !== 'connected') continue
-    if (tab.sessionId) continue // already has a session, skip
+    if (tab.sessionId) continue
 
-    // Verify debugger is still attached by sending a harmless command.
     try {
       const info = /** @type {any} */ (await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'))
       const targetInfo = info?.targetInfo
@@ -295,7 +279,6 @@ async function reannounceAllTabs() {
       const sessionId = `cb-tab-${nextSession++}`
       tab.sessionId = sessionId
       tab.targetId = targetId
-
       tabBySession.set(sessionId, tabId)
 
       sendToRelay({
@@ -312,26 +295,22 @@ async function reannounceAllTabs() {
 
       setBadge(tabId, 'on')
     } catch {
-      // Debugger was lost (e.g. tab closed or navigated to chrome://). Clean up.
       tabs.delete(tabId)
       setBadge(tabId, 'off')
     }
   }
 }
 
-/** Attach debugger to ALL existing normal tabs. */
 async function attachAllTabs() {
   const allTabs = await chrome.tabs.query({})
   for (const tab of allTabs) {
     if (!tab.id) continue
-    // Skip restricted URLs that the debugger cannot attach to.
     const url = tab.url || tab.pendingUrl || ''
     if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('devtools://') || url.startsWith('edge://')) continue
     await tryAttachTab(tab.id)
   }
 }
 
-/** Detach debugger from ALL currently attached tabs. */
 async function detachAllTabs() {
   const tabIds = [...tabs.keys()]
   for (const tabId of tabIds) {
@@ -339,10 +318,8 @@ async function detachAllTabs() {
   }
 }
 
-/** Global toggle: one click enables for all tabs, another click disables all. */
 async function toggleGlobal() {
   if (globalEnabled) {
-    // Turn OFF globally — persist to storage so worker restart respects it.
     globalEnabled = false
     await chrome.storage.local.set({ globalEnabled: false })
     clearRetryTimer()
@@ -350,28 +327,22 @@ async function toggleGlobal() {
     return
   }
 
-  // Turn ON globally
   globalEnabled = true
   await chrome.storage.local.set({ globalEnabled: true })
   await enableGlobal()
 }
 
-/** Enable relay connection + attach all tabs. Called on startup and toggle-on. */
 async function enableGlobal() {
   try {
     await ensureRelayConnection()
-    // Re-announce tabs whose debugger is still attached from before relay disconnect.
     await reannounceAllTabs()
-    // Attach any new tabs that aren't tracked yet.
     await attachAllTabs()
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    console.warn('enableGlobal failed, will retry', message)
+    console.warn('enableGlobal failed, will retry', err instanceof Error ? err.message : String(err))
     scheduleRetry()
   }
 }
 
-/** Schedule a retry to connect to relay. */
 function scheduleRetry() {
   clearRetryTimer()
   if (!globalEnabled) return
@@ -382,7 +353,6 @@ function scheduleRetry() {
   }, RETRY_INTERVAL)
 }
 
-/** Clear pending retry timer. */
 function clearRetryTimer() {
   if (retryTimer) {
     clearTimeout(retryTimer)
@@ -395,14 +365,12 @@ async function handleForwardCdpCommand(msg) {
   const params = msg?.params?.params || undefined
   const sessionId = typeof msg?.params?.sessionId === 'string' ? msg.params.sessionId : undefined
 
-  // Map command to tab
   const bySession = sessionId ? getTabBySessionId(sessionId) : null
   const targetId = typeof params?.targetId === 'string' ? params.targetId : undefined
   const tabId =
     bySession?.tabId ||
     (targetId ? getTabByTargetId(targetId) : null) ||
     (() => {
-      // No sessionId: pick the first connected tab (stable-ish).
       for (const [id, tab] of tabs.entries()) {
         if (tab.state === 'connected') return id
       }
@@ -496,60 +464,15 @@ function onDebuggerEvent(source, method, params) {
   }
 }
 
-/** @type {Map<number, ReturnType<typeof setTimeout>>} */
-const reattachTimers = new Map()
-
-function scheduleReattach(tabId, delay = 1000) {
-  cancelReattach(tabId)
-  if (!globalEnabled) return
-  const timer = setTimeout(async () => {
-    reattachTimers.delete(tabId)
-    if (!globalEnabled) return
-    // Check if tab still exists before trying to re-attach.
-    try {
-      await chrome.tabs.get(tabId)
-    } catch {
-      return // tab was closed
-    }
-    if (tabs.has(tabId)) return // already re-attached
-    try {
-      await ensureRelayConnection()
-    } catch {
-      // Relay is still down; retry later with backoff.
-      scheduleReattach(tabId, Math.min(delay * 2, 10000))
-      return
-    }
-    await tryAttachTab(tabId)
-    // tryAttachTab swallows errors, so verify connected state explicitly.
-    if (!tabs.has(tabId) || tabs.get(tabId)?.state !== 'connected') {
-      // Still failing (e.g. DevTools still open), retry with backoff (max 10s).
-      scheduleReattach(tabId, Math.min(delay * 2, 10000))
-    }
-  }, delay)
-  reattachTimers.set(tabId, timer)
-}
-
-function cancelReattach(tabId) {
-  const timer = reattachTimers.get(tabId)
-  if (timer) {
-    clearTimeout(timer)
-    reattachTimers.delete(tabId)
-  }
-}
-
 function onDebuggerDetach(source, reason) {
   const tabId = source.tabId
   if (!tabId) return
   if (!tabs.has(tabId)) return
   void detachTab(tabId, reason)
-
-  // Auto re-attach with persistent retry (e.g. after DevTools closes).
-  scheduleReattach(tabId)
 }
 
 chrome.action.onClicked.addListener(() => void toggleGlobal())
 
-// Auto-attach when a new tab finishes loading.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!globalEnabled) return
   if (changeInfo.status !== 'complete') return
@@ -566,7 +489,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   })()
 })
 
-// Auto-attach when a new tab is created.
 chrome.tabs.onCreated.addListener((tab) => {
   if (!globalEnabled) return
   if (!tab.id) return
@@ -586,8 +508,6 @@ chrome.tabs.onCreated.addListener((tab) => {
   }, 500)
 })
 
-// Auto-attach when a tab is activated (switched to foreground).
-// Catches tabs that were missed during relay reconnect or created by AI.
 chrome.tabs.onActivated.addListener((activeInfo) => {
   if (!globalEnabled) return
   const tabId = activeInfo.tabId
@@ -605,9 +525,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   })()
 })
 
-// Clean up state when a tab is closed.
 chrome.tabs.onRemoved.addListener((tabId) => {
-  cancelReattach(tabId)
   if (!tabs.has(tabId)) return
   const tab = tabs.get(tabId)
   if (tab?.sessionId) tabBySession.delete(tab.sessionId)
@@ -617,7 +535,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
 })
 
-// Only force-enable on first install, not on updates (respect user's toggle-off).
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
     chrome.storage.local.set({ globalEnabled: true })
@@ -626,11 +543,8 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 })
 
-// Auto-enable when service worker starts (e.g. after browser restart).
-// Reads persisted state so manual toggle-off survives worker restarts.
 void (async () => {
   const stored = await chrome.storage.local.get(['globalEnabled'])
-  // Default to true if never set (first run before onInstalled fires).
   globalEnabled = stored.globalEnabled !== false
   if (globalEnabled) {
     void enableGlobal()
