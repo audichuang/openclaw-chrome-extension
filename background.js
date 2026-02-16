@@ -107,13 +107,17 @@ function onRelayClosed(reason) {
     p.reject(new Error(`Relay disconnected (${reason})`))
   }
 
-  for (const tabId of tabs.keys()) {
-    void chrome.debugger.detach({ tabId }).catch(() => { })
-    setBadge(tabId, 'off')
-  }
-  tabs.clear()
+  // Keep debuggers attached — only clear relay-specific session mappings.
+  // Tabs stay in the `tabs` Map so we can re-announce them after reconnect.
   tabBySession.clear()
   childSessionToTab.clear()
+
+  // Mark all tabs as needing re-announce (clear sessionId so reannounce assigns new ones).
+  for (const tab of tabs.values()) {
+    if (tab.state === 'connected') {
+      tab.sessionId = undefined
+    }
+  }
 
   scheduleRetry()
 }
@@ -268,6 +272,44 @@ async function tryAttachTab(tabId) {
   }
 }
 
+async function reannounceAllTabs() {
+  for (const [tabId, tab] of tabs.entries()) {
+    if (tab.state !== 'connected') continue
+    if (tab.sessionId) continue // already has a session, skip
+
+    // Verify debugger is still attached by sending a harmless command.
+    try {
+      const info = /** @type {any} */ (await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'))
+      const targetInfo = info?.targetInfo
+      const targetId = String(targetInfo?.targetId || '').trim()
+      if (!targetId) throw new Error('no targetId')
+
+      const sessionId = `cb-tab-${nextSession++}`
+      tab.sessionId = sessionId
+      tab.targetId = targetId
+      tabBySession.set(sessionId, tabId)
+
+      sendToRelay({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          params: {
+            sessionId,
+            targetInfo: { ...targetInfo, attached: true },
+            waitingForDebugger: false,
+          },
+        },
+      })
+
+      setBadge(tabId, 'on')
+    } catch {
+      // Debugger was lost (e.g. tab closed or navigated to chrome://). Clean up.
+      tabs.delete(tabId)
+      setBadge(tabId, 'off')
+    }
+  }
+}
+
 async function attachAllTabs() {
   const allTabs = await chrome.tabs.query({})
   for (const tab of allTabs) {
@@ -302,6 +344,9 @@ async function toggleGlobal() {
 async function enableGlobal() {
   try {
     await ensureRelayConnection()
+    // Re-announce tabs whose debugger is still attached from before relay disconnect.
+    await reannounceAllTabs()
+    // Attach any new tabs that aren't tracked yet.
     await attachAllTabs()
   } catch (err) {
     console.warn('enableGlobal failed, will retry', err instanceof Error ? err.message : String(err))
