@@ -42,7 +42,7 @@ function setBadge(tabId, kind) {
   const cfg = BADGE[kind]
   void chrome.action.setBadgeText({ tabId, text: cfg.text })
   void chrome.action.setBadgeBackgroundColor({ tabId, color: cfg.color })
-  void chrome.action.setBadgeTextColor({ tabId, color: '#FFFFFF' }).catch(() => {})
+  void chrome.action.setBadgeTextColor({ tabId, color: '#FFFFFF' }).catch(() => { })
 }
 
 async function ensureRelayConnection() {
@@ -62,6 +62,9 @@ async function ensureRelayConnection() {
 
     const ws = new WebSocket(wsUrl)
 
+    // Install message handler BEFORE awaiting connection to avoid missing early messages.
+    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
+
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('WebSocket connect timeout')), 5000)
       ws.onopen = () => {
@@ -78,7 +81,7 @@ async function ensureRelayConnection() {
       }
     })
 
-    ws.onmessage = (event) => void onRelayMessage(String(event.data || ''))
+    relayWs = ws
     ws.onclose = () => onRelayClosed('closed')
     ws.onerror = () => onRelayClosed('error')
 
@@ -105,7 +108,7 @@ function onRelayClosed(reason) {
   }
 
   for (const tabId of tabs.keys()) {
-    void chrome.debugger.detach({ tabId }).catch(() => {})
+    void chrome.debugger.detach({ tabId }).catch(() => { })
     setBadge(tabId, 'off')
   }
   tabs.clear()
@@ -178,7 +181,7 @@ function getTabByTargetId(targetId) {
 async function attachTab(tabId, opts = {}) {
   const debuggee = { tabId }
   await chrome.debugger.attach(debuggee, '1.3')
-  await chrome.debugger.sendCommand(debuggee, 'Page.enable').catch(() => {})
+  await chrome.debugger.sendCommand(debuggee, 'Page.enable').catch(() => { })
 
   const info = /** @type {any} */ (await chrome.debugger.sendCommand(debuggee, 'Target.getTargetInfo'))
   const targetInfo = info?.targetInfo
@@ -265,42 +268,6 @@ async function tryAttachTab(tabId) {
   }
 }
 
-async function reannounceAllTabs() {
-  for (const [tabId, tab] of tabs.entries()) {
-    if (tab.state !== 'connected') continue
-    if (tab.sessionId) continue
-
-    try {
-      const info = /** @type {any} */ (await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo'))
-      const targetInfo = info?.targetInfo
-      const targetId = String(targetInfo?.targetId || '').trim()
-      if (!targetId) throw new Error('no targetId')
-
-      const sessionId = `cb-tab-${nextSession++}`
-      tab.sessionId = sessionId
-      tab.targetId = targetId
-      tabBySession.set(sessionId, tabId)
-
-      sendToRelay({
-        method: 'forwardCDPEvent',
-        params: {
-          method: 'Target.attachedToTarget',
-          params: {
-            sessionId,
-            targetInfo: { ...targetInfo, attached: true },
-            waitingForDebugger: false,
-          },
-        },
-      })
-
-      setBadge(tabId, 'on')
-    } catch {
-      tabs.delete(tabId)
-      setBadge(tabId, 'off')
-    }
-  }
-}
-
 async function attachAllTabs() {
   const allTabs = await chrome.tabs.query({})
   for (const tab of allTabs) {
@@ -335,7 +302,6 @@ async function toggleGlobal() {
 async function enableGlobal() {
   try {
     await ensureRelayConnection()
-    await reannounceAllTabs()
     await attachAllTabs()
   } catch (err) {
     console.warn('enableGlobal failed, will retry', err instanceof Error ? err.message : String(err))
@@ -420,9 +386,9 @@ async function handleForwardCdpCommand(msg) {
     const tab = await chrome.tabs.get(toActivate).catch(() => null)
     if (!tab) return {}
     if (tab.windowId) {
-      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {})
+      await chrome.windows.update(tab.windowId, { focused: true }).catch(() => { })
     }
-    await chrome.tabs.update(toActivate, { active: true }).catch(() => {})
+    await chrome.tabs.update(toActivate, { active: true }).catch(() => { })
     return {}
   }
 
@@ -464,11 +430,50 @@ function onDebuggerEvent(source, method, params) {
   }
 }
 
+/** @type {Map<number, ReturnType<typeof setTimeout>>} */
+const reattachTimers = new Map()
+
+function scheduleReattach(tabId, delay = 1000) {
+  cancelReattach(tabId)
+  if (!globalEnabled) return
+  const timer = setTimeout(async () => {
+    reattachTimers.delete(tabId)
+    if (!globalEnabled) return
+    try {
+      await chrome.tabs.get(tabId)
+    } catch {
+      return // tab was closed
+    }
+    if (tabs.has(tabId)) return // already re-attached
+    try {
+      await ensureRelayConnection()
+    } catch {
+      scheduleReattach(tabId, Math.min(delay * 2, 10000))
+      return
+    }
+    await tryAttachTab(tabId)
+    if (!tabs.has(tabId) || tabs.get(tabId)?.state !== 'connected') {
+      scheduleReattach(tabId, Math.min(delay * 2, 10000))
+    }
+  }, delay)
+  reattachTimers.set(tabId, timer)
+}
+
+function cancelReattach(tabId) {
+  const timer = reattachTimers.get(tabId)
+  if (timer) {
+    clearTimeout(timer)
+    reattachTimers.delete(tabId)
+  }
+}
+
 function onDebuggerDetach(source, reason) {
   const tabId = source.tabId
   if (!tabId) return
   if (!tabs.has(tabId)) return
   void detachTab(tabId, reason)
+  // Auto re-attach with persistent retry (e.g. after DevTools closes).
+  scheduleReattach(tabId)
 }
 
 chrome.action.onClicked.addListener(() => void toggleGlobal())
@@ -526,6 +531,7 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 })
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  cancelReattach(tabId)
   if (!tabs.has(tabId)) return
   const tab = tabs.get(tabId)
   if (tab?.sessionId) tabBySession.delete(tab.sessionId)
